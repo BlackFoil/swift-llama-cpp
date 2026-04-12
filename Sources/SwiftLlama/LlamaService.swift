@@ -100,6 +100,49 @@ public final actor LlamaService {
         return output
     }
 
+    /// Generate a plain text response from a pre-formatted prompt string.
+    /// Use this when the caller has already applied a chat template or
+    /// the model's built-in template is not compatible.
+    public func respond(text: String, samplingConfig: LlamaSamplingConfig) async throws -> String {
+        let stream = try await streamCompletion(of: text, samplingConfig: samplingConfig)
+        var output = ""
+        for try await token in stream {
+            output += token
+        }
+        return output
+    }
+
+    /// Stream token-by-token generation from a pre-formatted prompt string.
+    public func streamCompletion(of text: String, samplingConfig: LlamaSamplingConfig) async throws -> AsyncThrowingStream<String, Error> {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LlamaError.emptyPrompt
+        }
+        let llama = try initializeLlamaIfNecessary()
+        await stopCompletion()
+        try await llama.initializeCompletion(text: text)
+        await llama.updateSamplingConfig(samplingConfig)
+
+        return AsyncThrowingStream { continuation in
+            currentTask = Task {
+                do {
+                    generationLoop: while await (llama.currentTokenPosition < llama.maxTokenCount) {
+                        guard !Task.isCancelled else { break }
+                        let result = try await llama.generateNextToken()
+                        switch result {
+                        case .token(let token):
+                            continuation.yield(token)
+                        case .endOfString:
+                            break generationLoop
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
     public func streamCompletion<T: Codable>(of messages: [LlamaChatMessage], generating: T.Type) async throws -> AsyncThrowingStream<String, Error> {
         // Default: constrain the output to valid JSON matching the provided type
         let grammarConfig = try LlamaTypedJSONGrammarBuilder.makeGrammarConfig(for: generating)

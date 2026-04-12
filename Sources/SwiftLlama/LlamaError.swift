@@ -10,4 +10,5 @@ public enum LlamaError: Error{
     case contextSizeLimitExeeded
     case decodingError
     case emptyMessageArray
+    case emptyPrompt
 }
