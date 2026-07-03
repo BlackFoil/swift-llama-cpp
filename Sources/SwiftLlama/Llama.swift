@@ -122,6 +122,11 @@ final actor Llama {
                 print("### Using partial optimization from position \(divergenceIndex)")
                 do {
                     try optimizedReprocessing(newTokenList: tokenList, divergenceIndex: divergenceIndex)
+                } catch LlamaError.aborted {
+                    // LLM-8 (Codex R3-M1): a cancellation is not an optimization
+                    // failure — the fallback would silently swallow the abort
+                    // and burn a full reprocess. Propagate it.
+                    throw LlamaError.aborted
                 } catch {
                     print("Partial optimization failed, falling back to full reprocessing")
                     clear()
@@ -174,6 +179,9 @@ final actor Llama {
     }
 
     func generateNextToken() throws -> NextToken {
+        // LLM-8 layer 2: pre-mutation cancellation check — throwing here is a
+        // CLEAN abort (state and KV are still consistent, prefix cache kept).
+        try checkCancellationFlag()
         // Stop before sampling if we've reached the context limit to avoid mutating sampler state
         if currentTokenPosition >= Int32(maxTokenCount) {
             return .endOfString
@@ -186,16 +194,96 @@ final actor Llama {
 
         batch.reset()
         batch.addToken(newTokenId, at: currentTokenPosition, logits: true)
-        processedTokens.append(newTokenId)
+        try decodeGuarded(batch: batch)
 
+        // LLM-8 invariant: Swift state mutates only AFTER a successful decode —
+        // a failed decode must never leave processedTokens/position ahead of
+        // the KV cache (the old pre-decode append corrupted prefix reuse).
+        processedTokens.append(newTokenId)
         currentTokenPosition += 1
-        try context.decode(batch: batch)
 
         return .token(model.piece(from: newTokenId))
     }
 
     func updateSamplingConfig(_ config: LlamaSamplingConfig) {
         self.sampler = .init(config: config, model: model)
+    }
+
+    // MARK: - Cancellation (LLM-8)
+
+    /// Per-stream cancellation flag installed by LlamaService before
+    /// initializeCompletion. Layer 2 of the stop guarantee: checked at the
+    /// generateNextToken head and between prefill batches — backend-independent
+    /// and deterministic (the abort callback, layer 3, is best-effort only).
+    private var cancellationFlag: CancellationFlag?
+
+    func setCancellationFlag(_ flag: CancellationFlag?) {
+        cancellationFlag = flag
+    }
+
+    /// Layer 3 (best-effort): ggml abort callback. Per llama.h it "currently
+    /// works only with CPU execution", so it may be inert on Metal — layers
+    /// 1/2 carry the actual guarantee. `enabled: false` installs an inert
+    /// callback (used by tests to keep clean-cancel runs deterministic).
+    func installAbortCallback(enabled: Bool) {
+        if enabled, let flag = cancellationFlag {
+            context.setAbortCallback { flag.isCancelled }
+        } else {
+            context.setAbortCallback { false }
+        }
+    }
+
+    private func checkCancellationFlag() throws {
+        if cancellationFlag?.isCancelled == true {
+            throw LlamaError.aborted
+        }
+    }
+
+    /// Dirty-path reset: KV may hold partial writes from a failed decode, so
+    /// everything is conservatively discarded. Unlike the legacy `clear()`,
+    /// this also rewinds `currentTokenPosition` (clear() relies on a following
+    /// full processPrompt to fix it; there is none on the throw path).
+    private func resetState() {
+        context.clearKVCache()
+        processedTokens = []
+        currentTokenPosition = 0
+        batch = .init(initialSize: Int32(config.batchSize))
+    }
+
+    // MARK: - Test seams (LLM-8)
+
+    /// One-shot decode failure injection: the NEXT decode attempt throws
+    /// LlamaError.aborted. Consumed unconditionally (auto-false after firing)
+    /// so it cannot pollute later streams or tests.
+    private var testFailNextDecodeWithAborted = false
+
+    func _testFailNextDecodeWithAborted() {
+        testFailNextDecodeWithAborted = true
+    }
+
+    /// Single decode funnel with the LLM-8 state-consistency invariant baked
+    /// in: if a decode attempt throws, the dirty reset happens HERE, at the
+    /// throw site, before rethrowing — callers have no reset responsibility,
+    /// and clean throws (flag checks, empty prompt, context limit) never pass
+    /// through this function, so the clean/dirty distinction cannot be
+    /// miswired. The one-shot injection models a mid-decode abort and takes
+    /// the identical path.
+    private func decodeGuarded(batch: LlamaBatch) throws {
+        if testFailNextDecodeWithAborted {
+            testFailNextDecodeWithAborted = false
+            resetState()
+            throw LlamaError.aborted
+        }
+        do {
+            try context.decode(batch: batch)
+        } catch {
+            print("llama_decode() failed (\(error)) — resetting state")
+            resetState()
+            if let llamaError = error as? LlamaError {
+                throw llamaError
+            }
+            throw LlamaError.decodingError
+        }
     }
 
     private func clear() {
@@ -205,31 +293,39 @@ final actor Llama {
     }
 
     private func processBatch() throws {
-        do {
-            try context.decode(batch: batch)
-        } catch {
-            print("llama_decode() failed")
-            throw LlamaError.decodingError
-        }
+        // decodeGuarded already converts unknown errors to LlamaError and
+        // performs the dirty reset — rethrow untouched so `.aborted` is never
+        // masked as `.decodingError` (Codex R2-M1).
+        try decodeGuarded(batch: batch)
     }
 
     private func processPrompt(tokens: [llama_token], startIndex: Int) throws {
         guard !tokens.isEmpty else { return }
         batch.reset()
 
+        // LLM-8 invariant: append to processedTokens only after the batch
+        // decoded successfully, so a mid-prefill abort leaves Swift state and
+        // KV consistent (clean throw → prefix cache stays valid, no reset).
+        var pendingTokens: [llama_token] = []
         for i in 0..<tokens.count {
             let tokenPosition = startIndex + i
             let tokenId = tokens[i]
             batch.addToken(tokenId, at: Int32(tokenPosition), logits: false)
-            processedTokens.append(tokenId)
+            pendingTokens.append(tokenId)
             if batch.size == config.batchSize {
+                // LLM-8 layer 2: batch-boundary cancellation (clean abort).
+                try checkCancellationFlag()
                 try processBatch()
+                processedTokens.append(contentsOf: pendingTokens)
+                pendingTokens.removeAll(keepingCapacity: true)
                 batch.reset()
             }
         }
 
         batch.setLastTokenLogits(true)
+        try checkCancellationFlag()
         try processBatch()
+        processedTokens.append(contentsOf: pendingTokens)
 
         currentTokenPosition = Int32(processedTokens.count)
 

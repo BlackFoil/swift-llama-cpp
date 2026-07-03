@@ -81,6 +81,12 @@ public final class LlamaContext {
 
     public func decode(batch: LlamaBatch) throws {
         let returnCode = llama_decode(contextPointer, batch.rawBatch)
+        // llama_decode returns 2 when the abort callback fired mid-decode —
+        // that is a cancellation, not a decoding failure, and must not be
+        // masked as success (returnCode >= 0 used to swallow it).
+        if returnCode == 2 {
+            throw LlamaError.aborted
+        }
         guard returnCode >= 0 else {
             throw LlamaContextError.decodingError
         }

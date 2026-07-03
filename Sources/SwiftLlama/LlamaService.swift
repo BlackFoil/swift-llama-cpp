@@ -12,6 +12,10 @@ public final actor LlamaService {
     // MARK: Properties
     private var llama: Llama?
     private var currentTask: Task<(), Error>?
+    /// LLM-8: per-stream cancellation flag. Created fresh for every stream
+    /// (after stopCompletion, before initializeCompletion) so a cancelled
+    /// previous stream can never abort the next prefill.
+    private var currentCancellationFlag: CancellationFlag?
     private let modelUrl: URL
     private let config: LlamaConfig
 
@@ -27,6 +31,7 @@ public final actor LlamaService {
     public func processMessages(_ messages: [LlamaChatMessage]) async throws {
         let llama = try initializeLlamaIfNecessary()
         await stopCompletion()
+        await installFreshCancellationFlag(on: llama)
         try await llama.initializeCompletion(messages: messages, addAssistant: false)
     }
 
@@ -119,28 +124,12 @@ public final actor LlamaService {
         }
         let llama = try initializeLlamaIfNecessary()
         await stopCompletion()
+        // LLM-8: the flag must be live BEFORE initializeCompletion so a
+        // stopCompletion issued during the prefill aborts it (layer 2).
+        let flag = await installFreshCancellationFlag(on: llama)
         try await llama.initializeCompletion(text: text)
         await llama.updateSamplingConfig(samplingConfig)
-
-        return AsyncThrowingStream { continuation in
-            currentTask = Task {
-                do {
-                    generationLoop: while await (llama.currentTokenPosition < llama.maxTokenCount) {
-                        guard !Task.isCancelled else { break }
-                        let result = try await llama.generateNextToken()
-                        switch result {
-                        case .token(let token):
-                            continuation.yield(token)
-                        case .endOfString:
-                            break generationLoop
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-        }
+        return makeCompletionStream(llama: llama, flag: flag)
     }
 
     public func streamCompletion<T: Codable>(of messages: [LlamaChatMessage], generating: T.Type) async throws -> AsyncThrowingStream<String, Error> {
@@ -158,11 +147,18 @@ public final actor LlamaService {
         guard !messages.isEmpty else { throw LlamaError.emptyMessageArray }
         let llama = try initializeLlamaIfNecessary()
         await stopCompletion()
-        try await  llama.initializeCompletion(messages: messages)
+        // LLM-8: the flag must be live BEFORE initializeCompletion so a
+        // stopCompletion issued during the prefill aborts it (layer 2).
+        let flag = await installFreshCancellationFlag(on: llama)
+        try await llama.initializeCompletion(messages: messages)
         await llama.updateSamplingConfig(samplingConfig)
+        return makeCompletionStream(llama: llama, flag: flag)
+    }
 
-        return AsyncThrowingStream { continuation in
-            currentTask = Task {
+    /// Shared producer for both streamCompletion overloads.
+    private func makeCompletionStream(llama: Llama, flag: CancellationFlag) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task: Task<(), Error> = Task {
                 do {
                     generationLoop: while await (llama.currentTokenPosition < llama.maxTokenCount) {
                         guard !Task.isCancelled else { break }
@@ -179,11 +175,68 @@ public final actor LlamaService {
                     continuation.finish(throwing: error)
                 }
             }
+            currentTask = task
+            // LLM-8 layer 1: consumer termination (loop break, task cancel,
+            // iterator deinit) must reach the producer — without this the
+            // producer decodes to maxTokenCount into a dead buffer (F1 root
+            // cause). Runs synchronously on an arbitrary thread: only the
+            // thread-safe Task.cancel() / flag.cancel(), no actor calls.
+            continuation.onTermination = { _ in
+                task.cancel()
+                flag.cancel()
+            }
         }
     }
 
+    /// LLM-8: create and install a fresh per-stream flag (+ the best-effort
+    /// abort callback, layer 3, unless disabled by the test seam).
+    @discardableResult
+    private func installFreshCancellationFlag(on llama: Llama) async -> CancellationFlag {
+        let flag = CancellationFlag()
+        currentCancellationFlag = flag
+        await llama.setCancellationFlag(flag)
+        await llama.installAbortCallback(enabled: !disableAbortCallbackLayer)
+        return flag
+    }
+
     public func stopCompletion() async {
+        // Flag first: reaches the prefill (which has no Task to cancel) at the
+        // next batch boundary; the task cancel stops generation at the next
+        // token boundary; cancelAndWait guarantees the producer is fully done.
+        currentCancellationFlag?.cancel()
         await currentTask?.cancelAndWait()
+        currentCancellationFlag = nil
+        currentTask = nil
+    }
+
+    // MARK: - Test seams (LLM-8, internal — @testable only)
+
+    /// When true, streams do not install the best-effort abort callback
+    /// (layer 3), so clean-cancel tests exercise ONLY the guaranteed layers
+    /// (1/2, token/batch boundary) deterministically on any backend.
+    private var disableAbortCallbackLayer = false
+
+    func _testSetDisableAbortCallbackLayer(_ enabled: Bool) {
+        disableAbortCallbackLayer = enabled
+    }
+
+    /// Current token position of the underlying Llama (-1 if not initialized).
+    func _testCurrentTokenPosition() async -> Int32 {
+        guard let llama else { return -1 }
+        return await llama.currentTokenPosition
+    }
+
+    /// Processed-token count of the underlying Llama (-1 if not initialized).
+    func _testProcessedTokenCount() async -> Int {
+        guard let llama else { return -1 }
+        return await llama.processedTokens.count
+    }
+
+    /// Bridge to Llama's one-shot decode-abort injection (initializes the
+    /// model if needed so a fresh service can inject before its first stream).
+    func _testFailNextDecodeWithAborted() async {
+        guard let llama = try? initializeLlamaIfNecessary() else { return }
+        await llama._testFailNextDecodeWithAborted()
     }
 
     private func initializeLlamaIfNecessary() throws -> Llama {
