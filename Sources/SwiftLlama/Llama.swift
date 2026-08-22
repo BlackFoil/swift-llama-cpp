@@ -22,7 +22,13 @@ final actor Llama {
 
     init(modelPath: String, config: LlamaConfig) throws {
         self.config = config
-        llama_backend_init()
+        // N-x29: was a bare `llama_backend_init()`. Both guards below can throw,
+        // and Swift does not run `deinit` for an initializer that never
+        // finished — so every failed load (a corrupt gguf, a truncated
+        // download) left one backend initialization behind for the life of the
+        // process. Counted retain/release also stops the first instance to be
+        // released from freeing a backend another instance is still using.
+        LlamaBackend.retain()
         var model_params = llama_model_default_params()
 
         if !config.useGPU {
@@ -37,6 +43,7 @@ final actor Llama {
         let model = LlamaModel(path: modelPath, parameters: model_params)
         guard let model else {
             print("Could not load model at \(modelPath)")
+            LlamaBackend.release()
             throw LlamaError.couldNotInitializeContext
         }
 
@@ -54,6 +61,7 @@ final actor Llama {
         let context = LlamaContext(model: model, parameters: contextParam)
         guard let context else {
             print("Could not load context!")
+            LlamaBackend.release()
             throw LlamaError.couldNotInitializeContext
         }
 
@@ -65,7 +73,7 @@ final actor Llama {
     }
 
     deinit {
-        llama_backend_free()
+        LlamaBackend.release()
     }
 
     // Expose some backend/system utilities for convenience
