@@ -314,8 +314,19 @@ final actor Llama {
         // LLM-8 invariant: append to processedTokens only after the batch
         // decoded successfully, so a mid-prefill abort leaves Swift state and
         // KV consistent (clean throw → prefix cache stays valid, no reset).
+        //
+        // FormAI LLM-R123 HF-2: the last token is ALWAYS held back for the
+        // final batch. Before this, a prompt whose length was an exact
+        // multiple of `batchSize` flushed everything inside the loop and the
+        // trailing `processBatch()` ran on an EMPTY batch — llama_decode
+        // rejects n_tokens == 0 (ret -1) and the whole completion failed with
+        // `decodingError` (observed on device: squat live-coach prompt hit
+        // exactly N*128 tokens). Holding the last token back also guarantees
+        // the final batch is the one carrying `logits: true`, which sampling
+        // needs — the old shape would have requested logits on an empty batch
+        // in that same case.
         var pendingTokens: [llama_token] = []
-        for i in 0..<tokens.count {
+        for i in 0..<(tokens.count - 1) {
             let tokenPosition = startIndex + i
             let tokenId = tokens[i]
             batch.addToken(tokenId, at: Int32(tokenPosition), logits: false)
@@ -330,6 +341,10 @@ final actor Llama {
             }
         }
 
+        // Final batch: always contains at least the last prompt token.
+        let lastIndex = tokens.count - 1
+        batch.addToken(tokens[lastIndex], at: Int32(startIndex + lastIndex), logits: false)
+        pendingTokens.append(tokens[lastIndex])
         batch.setLastTokenLogits(true)
         try checkCancellationFlag()
         try processBatch()
